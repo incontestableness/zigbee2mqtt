@@ -199,6 +199,8 @@ function write(): void {
         ['mqtt', 'server'],
         ['mqtt', 'user'],
         ['mqtt', 'password'],
+        ['advanced', 'pan_id'],
+        ['advanced', 'ext_pan_id'],
         ['advanced', 'network_key'],
         ['frontend', 'auth_token'],
     ]) {
@@ -334,6 +336,14 @@ function read(): Settings {
 
     if (s.mqtt?.server) {
         s.mqtt.server = interpetValue(s.mqtt.server);
+    }
+
+    if (s.advanced?.pan_id) {
+        s.advanced.pan_id = interpetValue(s.advanced.pan_id);
+    }
+
+    if (s.advanced?.ext_pan_id) {
+        s.advanced.ext_pan_id = interpetValue(s.advanced.ext_pan_id);
     }
 
     if (s.advanced?.network_key) {
