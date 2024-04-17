@@ -359,11 +359,11 @@ function read(): Settings {
     }
 
     if (s.advanced?.pan_id) {
-        s.advanced.pan_id = interpetValue(s.advanced.pan_id);
+        s.advanced.pan_id = interpretValue(s.advanced.pan_id);
     }
 
     if (s.advanced?.ext_pan_id) {
-        s.advanced.ext_pan_id = interpetValue(s.advanced.ext_pan_id);
+        s.advanced.ext_pan_id = interpretValue(s.advanced.ext_pan_id);
     }
 
     if (s.advanced?.network_key) {
