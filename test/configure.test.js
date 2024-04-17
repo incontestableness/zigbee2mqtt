@@ -24,7 +24,7 @@ describe('Configure', () => {
         const endpoint2 = device.getEndpoint(2);
         expect(endpoint2.write).toHaveBeenCalledTimes(1);
         expect(endpoint2.write).toHaveBeenCalledWith("genBasic", {"49": {"type": 25, "value": 11}}, {"disableDefaultResponse": true, "manufacturerCode": 4107});
-        expect(device.meta.configured).toBe(1);
+        expect(device.meta.configured).toBe(1324213189);
     }
 
     const expectBulbConfigured = () => {
@@ -65,6 +65,7 @@ describe('Configure', () => {
         jest.useFakeTimers();
         controller = new Controller(jest.fn(), jest.fn());
         await controller.start();
+        await jest.runOnlyPendingTimers();
         await flushPromises();
     });
 
@@ -72,8 +73,9 @@ describe('Configure', () => {
         data.writeDefaultConfiguration();
         settings.reRead();
         mocksClear.forEach((m) => m.mockClear());
-     coordinatorEndpoint = zigbeeHerdsman.devices.coordinator.getEndpoint(1);
+        coordinatorEndpoint = zigbeeHerdsman.devices.coordinator.getEndpoint(1);
         await resetExtension();
+        await jest.runOnlyPendingTimers();
     });
 
     afterAll(async () => {
@@ -98,6 +100,17 @@ describe('Configure', () => {
         zigbeeHerdsman.events.deviceJoined(payload);
         await flushPromises();
         expectBulbConfigured();
+    });
+
+    it('Should not re-configure disabled devices', async () => {
+        expectBulbConfigured();
+        const device = zigbeeHerdsman.devices.bulb;
+        await flushPromises();
+        mockClear(device);
+        settings.set(['devices', device.ieeeAddr, 'disabled'], true);
+        zigbeeHerdsman.events.deviceJoined({device});
+        await flushPromises();
+        expectBulbNotConfigured();
     });
 
     it('Should reconfigure reporting on reconfigure event', async () => {
@@ -163,11 +176,11 @@ describe('Configure', () => {
     });
 
     it('Fail to configure via MQTT when device has no configure', async () => {
-        await MQTT.events.message('zigbee2mqtt/bridge/request/device/configure', stringify({id: "0x90fd9ffffe4b64ax", transaction: 20}));
+        await MQTT.events.message('zigbee2mqtt/bridge/request/device/configure', stringify({id: "0x0017882104a44559", transaction: 20}));
         await flushPromises();
         expect(MQTT.publish).toHaveBeenCalledWith(
             'zigbee2mqtt/bridge/response/device/configure',
-            stringify({"data":{"id": "0x90fd9ffffe4b64ax"},"status":"error","error": "Device 'ZNLDP12LM' cannot be configured","transaction":20}),
+            stringify({"data":{"id": "0x0017882104a44559"},"status":"error","error": "Device 'TS0601_thermostat' cannot be configured","transaction":20}),
             {retain: false, qos: 0}, expect.any(Function)
         );
     });
@@ -187,9 +200,9 @@ describe('Configure', () => {
     });
 
     it('Legacy api: Should skip reconfigure when device does not require this', async () => {
-        await MQTT.events.message('zigbee2mqtt/bridge/configure', '0x90fd9ffffe4b64ax');
+        await MQTT.events.message('zigbee2mqtt/bridge/configure', '0x0017882104a44559');
         await flushPromises();
-        expect(logger.warn).toHaveBeenCalledWith(`Skipping configure of 'ZNLDP12LM', device does not require this.`)
+        expect(logger.warn).toHaveBeenCalledWith(`Skipping configure of 'TS0601_thermostat', device does not require this.`)
     });
 
     it('Should not configure when interview not completed', async () => {

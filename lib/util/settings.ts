@@ -3,7 +3,7 @@ import utils from './utils';
 import objectAssignDeep from 'object-assign-deep';
 import path from 'path';
 import yaml from './yaml';
-import Ajv from 'ajv';
+import Ajv, {ValidateFunction} from 'ajv';
 import schemaJson from './settings.schema.json';
 export let schema = schemaJson;
 // @ts-ignore
@@ -31,7 +31,10 @@ const file = process.env.ZIGBEE2MQTT_CONFIG ?? data.joinPath('configuration.yaml
 const ajvSetting = new Ajv({allErrors: true}).addKeyword('requiresRestart').compile(schemaJson);
 const ajvRestartRequired = new Ajv({allErrors: true})
     .addKeyword({keyword: 'requiresRestart', validate: (s: unknown) => !s}).compile(schemaJson);
-
+const ajvRestartRequiredDeviceOptions = new Ajv({allErrors: true})
+    .addKeyword({keyword: 'requiresRestart', validate: (s: unknown) => !s}).compile(schemaJson.definitions.device);
+const ajvRestartRequiredGroupOptions = new Ajv({allErrors: true})
+    .addKeyword({keyword: 'requiresRestart', validate: (s: unknown) => !s}).compile(schemaJson.definitions.group);
 const defaults: RecursivePartial<Settings> = {
     permit_join: false,
     external_converters: [],
@@ -147,7 +150,7 @@ function loadSettingsWithDefaults(): void {
     }
 
     if (_settingsWithDefaults.frontend) {
-        const defaults = {port: 8080, auth_token: false, host: '0.0.0.0'};
+        const defaults = {port: 8080, auth_token: false};
         const s = typeof _settingsWithDefaults.frontend === 'object' ? _settingsWithDefaults.frontend : {};
         // @ts-ignore
         _settingsWithDefaults.frontend = {};
@@ -187,6 +190,20 @@ function loadSettingsWithDefaults(): void {
     _settingsWithDefaults.whitelist && _settingsWithDefaults.passlist.push(..._settingsWithDefaults.whitelist);
 }
 
+function parseValueRef(text: string): {filename: string, key: string} | null {
+    const match = /!(.*) (.*)/g.exec(text);
+    if (match) {
+        let filename = match[1];
+        // This is mainly for backward compatibility.
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
+            filename += '.yaml';
+        }
+        return {filename, key: match[2]};
+    } else {
+        return null;
+    }
+}
+
 function write(): void {
     const settings = getInternalSettings();
     const toWrite: KeyValue = objectAssignDeep({}, settings);
@@ -194,7 +211,7 @@ function write(): void {
     // Read settings to check if we have to split devices/groups into separate file.
     const actual = yaml.read(file);
 
-    // In case the setting is defined in a separte file (e.g. !secret network_key) update it there.
+    // In case the setting is defined in a separate file (e.g. !secret network_key) update it there.
     for (const path of [
         ['mqtt', 'server'],
         ['mqtt', 'user'],
@@ -205,9 +222,9 @@ function write(): void {
         ['frontend', 'auth_token'],
     ]) {
         if (actual[path[0]] && actual[path[0]][path[1]]) {
-            const match = /!(.*) (.*)/g.exec(actual[path[0]][path[1]]);
-            if (match) {
-                yaml.updateIfChanged(data.joinPath(`${match[1]}.yaml`), match[2], toWrite[path[0]][path[1]]);
+            const ref = parseValueRef(actual[path[0]][path[1]]);
+            if (ref) {
+                yaml.updateIfChanged(data.joinPath(ref.filename), ref.key, toWrite[path[0]][path[1]]);
                 toWrite[path[0]][path[1]] = actual[path[0]][path[1]];
             }
         }
@@ -215,7 +232,7 @@ function write(): void {
 
     // Write devices/groups to separate file if required.
     const writeDevicesOrGroups = (type: 'devices' | 'groups'): void => {
-        if (typeof actual[type] === 'string' || Array.isArray(actual[type])) {
+        if (typeof actual[type] === 'string' || (Array.isArray(actual[type]) && actual[type].length > 0)) {
             const fileToWrite = Array.isArray(actual[type]) ? actual[type][0] : actual[type];
             const content = objectAssignDeep({}, settings[type]);
 
@@ -270,6 +287,11 @@ export function validate(): string[] {
         errors.push(`advanced.pan_id: should be number or 'GENERATE' (is '${_settings.advanced.pan_id}')`);
     }
 
+    if (_settings.advanced && _settings.advanced.ext_pan_id && typeof _settings.advanced.ext_pan_id === 'string' &&
+        _settings.advanced.ext_pan_id !== 'GENERATE') {
+        errors.push(`advanced.ext_pan_id: should be array or 'GENERATE' (is '${_settings.advanced.ext_pan_id}')`);
+    }
+
     // Verify that all friendly names are unique
     const names: string[] = [];
     const check = (e: DeviceOptions | GroupOptions): void => {
@@ -311,31 +333,29 @@ export function validate(): string[] {
 
 function read(): Settings {
     const s = yaml.read(file) as Settings;
+    applyEnvironmentVariables(s);
 
     // Read !secret MQTT username and password if set
     // eslint-disable-next-line
-    const interpetValue = (value: any): any => {
-        const re = /!(.*) (.*)/g;
-        const match = re.exec(value);
-        if (match) {
-            const file = data.joinPath(`${match[1]}.yaml`);
-            const key = match[2];
-            return yaml.read(file)[key];
+    const interpretValue = (value: any): any => {
+        const ref = parseValueRef(value);
+        if (ref) {
+            return yaml.read(data.joinPath(ref.filename))[ref.key];
         } else {
             return value;
         }
     };
 
     if (s.mqtt?.user) {
-        s.mqtt.user = interpetValue(s.mqtt.user);
+        s.mqtt.user = interpretValue(s.mqtt.user);
     }
 
     if (s.mqtt?.password) {
-        s.mqtt.password = interpetValue(s.mqtt.password);
+        s.mqtt.password = interpretValue(s.mqtt.password);
     }
 
     if (s.mqtt?.server) {
-        s.mqtt.server = interpetValue(s.mqtt.server);
+        s.mqtt.server = interpretValue(s.mqtt.server);
     }
 
     if (s.advanced?.pan_id) {
@@ -347,16 +367,16 @@ function read(): Settings {
     }
 
     if (s.advanced?.network_key) {
-        s.advanced.network_key = interpetValue(s.advanced.network_key);
+        s.advanced.network_key = interpretValue(s.advanced.network_key);
     }
 
     if (s.frontend?.auth_token) {
-        s.frontend.auth_token = interpetValue(s.frontend.auth_token);
+        s.frontend.auth_token = interpretValue(s.frontend.auth_token);
     }
 
     // Read devices/groups configuration from separate file if specified.
     const readDevicesOrGroups = (type: 'devices' | 'groups'): void => {
-        if (typeof s[type] === 'string' || Array.isArray(s[type])) {
+        if (typeof s[type] === 'string' || (Array.isArray(s[type]) && Array(s[type]).length > 0)) {
             /* eslint-disable-line */ // @ts-ignore
             const files: string[] = Array.isArray(s[type]) ? s[type] : [s[type]];
             s[type] = {};
@@ -391,7 +411,11 @@ function applyEnvironmentVariables(settings: Partial<Settings>): void {
                         }, settings);
 
                         if (type.indexOf('object') >= 0 || type.indexOf('array') >= 0) {
-                            setting[key] = JSON.parse(process.env[envVariableName]);
+                            try {
+                                setting[key] = JSON.parse(process.env[envVariableName]);
+                            } catch (error) {
+                                setting[key] = process.env[envVariableName];
+                            }
                         } else if (type.indexOf('number') >= 0) {
                             /* eslint-disable-line */ // @ts-ignore
                             setting[key] = process.env[envVariableName] * 1;
@@ -422,7 +446,6 @@ function applyEnvironmentVariables(settings: Partial<Settings>): void {
 function getInternalSettings(): Partial<Settings> {
     if (!_settings) {
         _settings = read();
-        applyEnvironmentVariables(_settings);
     }
 
     return _settings;
@@ -464,7 +487,7 @@ export function apply(newSettings: Record<string, unknown>): boolean {
         throw new Error(`${error.instancePath.substring(1)} ${error.message}`);
     }
 
-    getInternalSettings(); // Ensure _settings is intialized.
+    getInternalSettings(); // Ensure _settings is initialized.
     /* eslint-disable-line */ // @ts-ignore
     _settings = objectAssignDeep.noMutate(_settings, newSettings);
     write();
@@ -580,7 +603,7 @@ export function removeDevice(IDorName: string): void {
     // Remove device from groups
     if (settings.groups) {
         const regex =
-            new RegExp(`^(${device.friendly_name}|${device.ID})(/(\\d|${utils.endpointNames.join('|')}))?$`);
+            new RegExp(`^(${device.friendly_name}|${device.ID})(/[^/]+)?$`);
         for (const group of Object.values(settings.groups).filter((g) => g.devices)) {
             group.devices = group.devices.filter((device) => !device.match(regex));
         }
@@ -662,21 +685,27 @@ export function removeGroup(IDorName: string | number): void {
     write();
 }
 
-export function changeEntityOptions(IDorName: string, newOptions: KeyValue): void {
+export function changeEntityOptions(IDorName: string, newOptions: KeyValue): boolean {
     const settings = getInternalSettings();
     delete newOptions.friendly_name;
     delete newOptions.devices;
+    let validator: ValidateFunction;
     if (getDevice(IDorName)) {
         objectAssignDeep(settings.devices[getDevice(IDorName).ID], newOptions);
         utils.removeNullPropertiesFromObject(settings.devices[getDevice(IDorName).ID]);
+        validator = ajvRestartRequiredDeviceOptions;
     } else if (getGroup(IDorName)) {
         objectAssignDeep(settings.groups[getGroup(IDorName).ID], newOptions);
         utils.removeNullPropertiesFromObject(settings.groups[getGroup(IDorName).ID]);
+        validator = ajvRestartRequiredGroupOptions;
     } else {
         throw new Error(`Device or group '${IDorName}' does not exist`);
     }
 
     write();
+    validator(newOptions);
+    const restartRequired = validator.errors && !!validator.errors.find((e) => e.keyword === 'requiresRestart');
+    return restartRequired;
 }
 
 export function changeFriendlyName(IDorName: string, newName: string): void {

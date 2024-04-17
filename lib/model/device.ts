@@ -1,10 +1,10 @@
 /* eslint-disable brace-style */
 import * as settings from '../util/settings';
-import zigbeeHerdsmanConverters from 'zigbee-herdsman-converters';
+import * as zhc from 'zigbee-herdsman-converters';
 
 export default class Device {
     public zh: zh.Device;
-    private _definition: zhc.Definition;
+    public definition: zhc.Definition;
     private _definitionModelID: string;
 
     get ieeeAddr(): string {return this.zh.ieeeAddr;}
@@ -13,26 +13,28 @@ export default class Device {
     get name(): string {
         return this.zh.type === 'Coordinator' ? 'Coordinator' : this.options?.friendly_name || this.ieeeAddr;
     }
-    get definition(): zhc.Definition {
-        // Some devices can change modelID, reconsider the definition in that case.
-        // https://github.com/Koenkk/zigbee-herdsman-converters/issues/3016
-        if (!this.zh.interviewing && (!this._definition || this._definitionModelID !== this.zh.modelID)) {
-            this._definition = zigbeeHerdsmanConverters.findByDevice(this.zh);
-            this._definitionModelID = this.zh.modelID;
-        }
-        return this._definition;
+    get isSupported(): boolean {
+        return this.zh.type === 'Coordinator' || (this.definition && !this.definition.generated);
     }
 
     constructor(device: zh.Device) {
         this.zh = device;
     }
 
-    exposes(): zhc.DefinitionExpose[] {
+    exposes(): zhc.Expose[] {
         /* istanbul ignore if */
         if (typeof this.definition.exposes == 'function') {
-            return this.definition.exposes(this.zh, this.options);
+            const options: KeyValue = this.options;
+            return this.definition.exposes(this.zh, options);
         } else {
             return this.definition.exposes;
+        }
+    }
+
+    async resolveDefinition(): Promise<void> {
+        if (!this.zh.interviewing && (!this.definition || this._definitionModelID !== this.zh.modelID)) {
+            this.definition = await zhc.findByDevice(this.zh, true);
+            this._definitionModelID = this.zh.modelID;
         }
     }
 
@@ -63,12 +65,21 @@ export default class Device {
     }
 
     endpointName(endpoint: zh.Endpoint): string {
-        let name = null;
+        let epName = null;
         if (this.definition?.endpoint) {
-            name = Object.entries(this.definition?.endpoint(this.zh)).find((e) => e[1] == endpoint.ID)[0];
+            const mapping = this.definition?.endpoint(this.zh);
+            for (const [name, id] of Object.entries(mapping)) {
+                if (id == endpoint.ID) {
+                    epName = name;
+                }
+            }
         }
         /* istanbul ignore next */
-        return name === 'default' ? null : name;
+        return epName === 'default' ? null : epName;
+    }
+
+    getEndpointNames(): string[] {
+        return Object.keys(this.definition?.endpoint?.(this.zh) ?? {}).filter((name) => name !== 'default');
     }
 
     isIkeaTradfri(): boolean {return this.zh.manufacturerID === 4476;}

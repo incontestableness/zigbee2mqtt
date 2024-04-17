@@ -7,13 +7,14 @@ import bind from 'bind-decorator';
 import Extension from './extension';
 import Device from '../model/device';
 import Group from '../model/group';
+import * as zhc from 'zigbee-herdsman-converters';
 
 const topicRegex =
     new RegExp(`^${settings.get().mqtt.base_topic}/bridge/request/group/members/(remove|add|remove_all)$`);
 const legacyTopicRegex = new RegExp(`^${settings.get().mqtt.base_topic}/bridge/group/(.+)/(remove|add|remove_all)$`);
 const legacyTopicRegexRemoveAll = new RegExp(`^${settings.get().mqtt.base_topic}/bridge/group/remove_all$`);
 
-const stateProperties: {[s: string]: (value: string, exposes: zhc.DefinitionExpose[]) => boolean} = {
+const stateProperties: {[s: string]: (value: string, exposes: zhc.Expose[]) => boolean} = {
     'state': () => true,
     'brightness': (value, exposes) =>
         !!exposes.find((e) => e.type === 'light' && e.features.find((f) => f.name === 'brightness')),
@@ -67,10 +68,13 @@ export default class Groups extends Extension {
             const groupID = settingGroup.ID;
             const zigbeeGroup = zigbeeGroups.find((g) => g.ID === groupID) || this.zigbee.createGroup(groupID);
             const settingsEndpoint = settingGroup.devices.map((d) => {
-                const parsed = utils.parseEntityID(d);
-                const entity = this.zigbee.resolveEntity(parsed.ID) as Device;
+                const parsed = this.zigbee.resolveEntityAndEndpoint(d);
+                const entity = parsed.entity as Device;
                 if (!entity) logger.error(`Cannot find '${d}' of group '${settingGroup.friendly_name}'`);
-                return {'endpoint': entity?.endpoint(parsed.endpoint), 'name': entity?.name};
+                if (parsed.endpointID && !parsed.endpoint) {
+                    logger.error(`Cannot find endpoint '${parsed.endpointID}' of device '${parsed.ID}'`);
+                }
+                return {'endpoint': parsed.endpoint, 'name': entity?.name};
             }).filter((e) => e.endpoint != null);
 
             // In settings but not in zigbee
@@ -101,15 +105,16 @@ export default class Groups extends Extension {
 
     @bind async onStateChange(data: eventdata.StateChange): Promise<void> {
         const reason = 'groupOptimistic';
-        if (data.reason === reason) {
+        if (data.reason === reason || data.reason === 'publishCached') {
             return;
         }
 
         const payload: KeyValue = {};
 
         let endpointName: string = null;
+        const endpointNames: string[] = data.entity instanceof Device ? data.entity.getEndpointNames() : [];
         for (let [prop, value] of Object.entries(data.update)) {
-            const endpointNameMatch = utils.endpointNames.find((n) => prop.endsWith(`_${n}`));
+            const endpointNameMatch = endpointNames.find((n) => prop.endsWith(`_${n}`));
             if (endpointNameMatch) {
                 prop = prop.substring(0, prop.length - endpointNameMatch.length - 1);
                 endpointName = endpointNameMatch;
@@ -142,6 +147,7 @@ export default class Groups extends Extension {
                 const groupsToPublish: Set<Group> = new Set();
                 for (const member of entity.zh.members) {
                     const device = this.zigbee.resolveEntity(member.getDevice()) as Device;
+                    if (device.options.disabled) continue;
                     const exposes = device.exposes();
                     const memberPayload: KeyValue = {};
                     Object.keys(payload).forEach((key) => {
@@ -235,8 +241,8 @@ export default class Groups extends Extension {
                 type = 'remove_all';
             }
 
-            const parsedEntity = utils.parseEntityID(data.message);
-            resolvedEntityDevice = this.zigbee.resolveEntity(parsedEntity.ID) as Device;
+            const parsedEntity = this.zigbee.resolveEntityAndEndpoint(data.message);
+            resolvedEntityDevice = parsedEntity.entity as Device;
             if (!resolvedEntityDevice || !(resolvedEntityDevice instanceof Device)) {
                 logger.error(`Device '${data.message}' does not exist`);
 
@@ -253,7 +259,12 @@ export default class Groups extends Extension {
 
                 return null;
             }
-            resolvedEntityEndpoint = resolvedEntityDevice.endpoint(parsedEntity.endpoint);
+
+            resolvedEntityEndpoint = parsedEntity.endpoint;
+            if (parsedEntity.endpointID && !resolvedEntityEndpoint) {
+                logger.error(`Device '${parsedEntity.ID}' does not have endpoint '${parsedEntity.endpointID}'`);
+                return null;
+            }
         } else if (topicRegexMatch) {
             type = topicRegexMatch[1] as 'remove' | 'add' | 'remove_all';
             const message = JSON.parse(data.message);
@@ -268,13 +279,16 @@ export default class Groups extends Extension {
                 }
             }
 
-            const parsed = utils.parseEntityID(message.device);
-            resolvedEntityDevice = this.zigbee.resolveEntity(parsed.ID) as Device;
+            const parsed = this.zigbee.resolveEntityAndEndpoint(message.device);
+            resolvedEntityDevice = parsed?.entity as Device;
             if (!error && (!resolvedEntityDevice || !(resolvedEntityDevice instanceof Device))) {
                 error = `Device '${message.device}' does not exist`;
             }
             if (!error) {
-                resolvedEntityEndpoint = resolvedEntityDevice.endpoint(parsed.endpoint);
+                resolvedEntityEndpoint = parsed.endpoint;
+                if (parsed.endpointID && !resolvedEntityEndpoint) {
+                    error = `Device '${parsed.ID}' does not have endpoint '${parsed.endpointID}'`;
+                }
             }
         }
 
@@ -292,6 +306,7 @@ export default class Groups extends Extension {
             groupKey, deviceKey, skipDisableReporting, resolvedEntityEndpoint,
         } = parsed;
         const message = utils.parseJSON(data.message, data.message);
+        let changedGroups: Group[] = [];
 
         const responseData: KeyValue = {device: deviceKey};
         if (groupKey) {
@@ -320,6 +335,7 @@ export default class Groups extends Extension {
                     logger.info(`Adding '${resolvedEntityDevice.name}' to '${resolvedEntityGroup.name}'`);
                     await resolvedEntityEndpoint.addToGroup(resolvedEntityGroup.zh);
                     settings.addDeviceToGroup(resolvedEntityGroup.ID.toString(), keys);
+                    changedGroups.push(resolvedEntityGroup);
 
                     /* istanbul ignore else */
                     if (settings.get().advanced.legacy_api) {
@@ -333,6 +349,7 @@ export default class Groups extends Extension {
                     logger.info(`Removing '${resolvedEntityDevice.name}' from '${resolvedEntityGroup.name}'`);
                     await resolvedEntityEndpoint.removeFromGroup(resolvedEntityGroup.zh);
                     settings.removeDeviceFromGroup(resolvedEntityGroup.ID.toString(), keys);
+                    changedGroups.push(resolvedEntityGroup);
 
                     /* istanbul ignore else */
                     if (settings.get().advanced.legacy_api) {
@@ -344,6 +361,7 @@ export default class Groups extends Extension {
                     }
                 } else { // remove_all
                     logger.info(`Removing '${resolvedEntityDevice.name}' from all groups`);
+                    changedGroups = this.zigbee.groups().filter((g) => g.zh.members.includes(resolvedEntityEndpoint));
                     await resolvedEntityEndpoint.removeFromAllGroups();
                     for (const settingsGroup of settings.getGroups()) {
                         settings.removeDeviceFromGroup(settingsGroup.ID.toString(), keys);
@@ -372,8 +390,10 @@ export default class Groups extends Extension {
         if (error) {
             logger.error(error);
         } else {
-            this.eventBus.emitGroupMembersChanged({
-                group: resolvedEntityGroup, action: type, endpoint: resolvedEntityEndpoint, skipDisableReporting});
+            for (const group of changedGroups) {
+                this.eventBus.emitGroupMembersChanged({
+                    group, action: type, endpoint: resolvedEntityEndpoint, skipDisableReporting});
+            }
         }
     }
 }

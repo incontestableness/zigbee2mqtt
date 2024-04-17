@@ -4,7 +4,7 @@ import utils from '../util/utils';
 import Extension from './extension';
 import stringify from 'json-stable-stringify-without-jsonify';
 import debounce from 'debounce';
-import * as zigbeeHersdman from 'zigbee-herdsman/dist';
+import * as zigbeeHerdsman from 'zigbee-herdsman/dist';
 import bind from 'bind-decorator';
 import Device from '../model/device';
 import Group from '../model/group';
@@ -12,8 +12,9 @@ import Group from '../model/group';
 const legacyApi = settings.get().advanced.legacy_api;
 const legacyTopicRegex = new RegExp(`^${settings.get().mqtt.base_topic}/bridge/(bind|unbind)/.+$`);
 const topicRegex = new RegExp(`^${settings.get().mqtt.base_topic}/bridge/request/device/(bind|unbind)`);
-const clusterCandidates = ['genScenes', 'genOnOff', 'genLevelCtrl', 'lightingColorCtrl', 'closuresWindowCovering',
-    'hvacThermostat', 'msTemperatureMeasurement'];
+const allClusterCandidates = ['genScenes', 'genOnOff', 'genLevelCtrl', 'lightingColorCtrl', 'closuresWindowCovering',
+    'hvacThermostat', 'msIlluminanceMeasurement', 'msTemperatureMeasurement', 'msRelativeHumidity',
+    'msSoilMoisture', 'msCO2'];
 
 // See zigbee-herdsman-converters
 const defaultBindGroup = {type: 'group_number', ID: 901, name: 'default_bind_group'};
@@ -67,7 +68,8 @@ const reportClusters: {[s: string]:
 type PollOnMessage = {
     cluster: {[s: string]: {type: string, data: KeyValue}[]}
     read: {cluster: string, attributes: string[], attributesForEndpoint?: (endpoint: zh.Endpoint) => Promise<string[]>}
-    manufacturerIDs: number[]
+    manufacturerIDs: number[],
+    manufacturerNames: string [],
 }[];
 
 const pollOnMessage: PollOnMessage = [
@@ -95,11 +97,16 @@ const pollOnMessage: PollOnMessage = [
         read: {cluster: 'genLevelCtrl', attributes: ['currentLevel']},
         // When the bound devices/members of group have the following manufacturerIDs
         manufacturerIDs: [
-            zigbeeHersdman.Zcl.ManufacturerCode.Philips,
-            zigbeeHersdman.Zcl.ManufacturerCode.ATMEL,
-            zigbeeHersdman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
-            zigbeeHersdman.Zcl.ManufacturerCode.MUELLER_LICHT_INT,
-            zigbeeHersdman.Zcl.ManufacturerCode.TELINK,
+            zigbeeHerdsman.Zcl.ManufacturerCode.SIGNIFY_NETHERLANDS_B_V,
+            zigbeeHerdsman.Zcl.ManufacturerCode.ATMEL,
+            zigbeeHerdsman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
+            zigbeeHerdsman.Zcl.ManufacturerCode.MUELLER_LICHT_INTERNATIONAL_INC,
+            zigbeeHerdsman.Zcl.ManufacturerCode.TELINK_MICRO,
+            zigbeeHerdsman.Zcl.ManufacturerCode.BUSCH_JAEGER_ELEKTRO,
+        ],
+        manufacturerNames: [
+            'GLEDOPTO',
+            'Trust International B.V.\u0000',
         ],
     },
     {
@@ -126,11 +133,16 @@ const pollOnMessage: PollOnMessage = [
         },
         read: {cluster: 'genOnOff', attributes: ['onOff']},
         manufacturerIDs: [
-            zigbeeHersdman.Zcl.ManufacturerCode.Philips,
-            zigbeeHersdman.Zcl.ManufacturerCode.ATMEL,
-            zigbeeHersdman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
-            zigbeeHersdman.Zcl.ManufacturerCode.MUELLER_LICHT_INT,
-            zigbeeHersdman.Zcl.ManufacturerCode.TELINK,
+            zigbeeHerdsman.Zcl.ManufacturerCode.SIGNIFY_NETHERLANDS_B_V,
+            zigbeeHerdsman.Zcl.ManufacturerCode.ATMEL,
+            zigbeeHerdsman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
+            zigbeeHerdsman.Zcl.ManufacturerCode.MUELLER_LICHT_INTERNATIONAL_INC,
+            zigbeeHerdsman.Zcl.ManufacturerCode.TELINK_MICRO,
+            zigbeeHerdsman.Zcl.ManufacturerCode.BUSCH_JAEGER_ELEKTRO,
+        ],
+        manufacturerNames: [
+            'GLEDOPTO',
+            'Trust International B.V.\u0000',
         ],
     },
     {
@@ -153,11 +165,16 @@ const pollOnMessage: PollOnMessage = [
             },
         },
         manufacturerIDs: [
-            zigbeeHersdman.Zcl.ManufacturerCode.Philips,
-            zigbeeHersdman.Zcl.ManufacturerCode.ATMEL,
-            zigbeeHersdman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
-            zigbeeHersdman.Zcl.ManufacturerCode.MUELLER_LICHT_INT,
-            zigbeeHersdman.Zcl.ManufacturerCode.TELINK,
+            zigbeeHerdsman.Zcl.ManufacturerCode.SIGNIFY_NETHERLANDS_B_V,
+            zigbeeHerdsman.Zcl.ManufacturerCode.ATMEL,
+            zigbeeHerdsman.Zcl.ManufacturerCode.GLEDOPTO_CO_LTD,
+            zigbeeHerdsman.Zcl.ManufacturerCode.MUELLER_LICHT_INTERNATIONAL_INC,
+            zigbeeHerdsman.Zcl.ManufacturerCode.TELINK_MICRO,
+            // Note: ManufacturerCode.BUSCH_JAEGER is left out intentionally here as their devices don't support colors
+        ],
+        manufacturerNames: [
+            'GLEDOPTO',
+            'Trust International B.V.\u0000',
         ],
     },
 ];
@@ -205,32 +222,35 @@ export default class Bind extends Extension {
         const message = utils.parseJSON(data.message, data.message);
 
         let error = null;
-        const parsedSource = utils.parseEntityID(sourceKey);
-        const parsedTarget = utils.parseEntityID(targetKey);
-        const source = this.zigbee.resolveEntity(parsedSource.ID);
-        const target = targetKey === 'default_bind_group' ?
-            defaultBindGroup : this.zigbee.resolveEntity(parsedTarget.ID);
+        const parsedSource = this.zigbee.resolveEntityAndEndpoint(sourceKey);
+        const parsedTarget = this.zigbee.resolveEntityAndEndpoint(targetKey);
+        const source = parsedSource.entity;
+        const target = targetKey === 'default_bind_group' ? defaultBindGroup : parsedTarget.entity;
         const responseData: KeyValue = {from: sourceKey, to: targetKey};
 
         if (!source || !(source instanceof Device)) {
             error = `Source device '${sourceKey}' does not exist`;
+        } else if (parsedSource.endpointID && !parsedSource.endpoint) {
+            error = `Source device '${parsedSource.ID}' does not have endpoint '${parsedSource.endpointID}'`;
         } else if (!target) {
             error = `Target device or group '${targetKey}' does not exist`;
+        } else if (target instanceof Device && parsedTarget.endpointID && !parsedTarget.endpoint) {
+            error = `Target device '${parsedTarget.ID}' does not have endpoint '${parsedTarget.endpointID}'`;
         } else {
             const successfulClusters: string[] = [];
             const failedClusters = [];
             const attemptedClusters = [];
 
-            const bindSource: zh.Endpoint = source.endpoint(parsedSource.endpoint);
+            const bindSource: zh.Endpoint = parsedSource.endpoint;
             let bindTarget: number | zh.Group | zh.Endpoint = null;
-            if (target instanceof Device) bindTarget = target.endpoint(parsedTarget.endpoint);
+            if (target instanceof Device) bindTarget = parsedTarget.endpoint;
             else if (target instanceof Group) bindTarget = target.zh;
             else bindTarget = Number(target.ID);
 
             // Find which clusters are supported by both the source and target.
             // Groups are assumed to support all clusters.
+            const clusterCandidates = clusters ?? allClusterCandidates;
             for (const cluster of clusterCandidates) {
-                if (clusters && !clusters.includes(cluster)) continue;
                 let matchingClusters = false;
 
                 const anyClusterValid = utils.isZHGroup(bindTarget) || typeof bindTarget === 'number' ||
@@ -372,7 +392,7 @@ export default class Bind extends Extension {
                     }
 
                     await endpoint.configureReporting(bind.cluster.name, items);
-                    logger.info(`Succesfully setup reporting for '${entity}' cluster '${bind.cluster.name}'`);
+                    logger.info(`Successfully setup reporting for '${entity}' cluster '${bind.cluster.name}'`);
                 } catch (error) {
                     logger.warn(`Failed to setup reporting for '${entity}' cluster '${bind.cluster.name}'`);
                 }
@@ -414,7 +434,7 @@ export default class Bind extends Extension {
                     }
 
                     await endpoint.configureReporting(cluster, items);
-                    logger.info(`Succesfully disabled reporting for '${entity}' cluster '${cluster}'`);
+                    logger.info(`Successfully disabled reporting for '${entity}' cluster '${cluster}'`);
                 } catch (error) {
                     logger.warn(`Failed to disable reporting for '${entity}' cluster '${cluster}'`);
                 }
@@ -455,7 +475,8 @@ export default class Bind extends Extension {
 
             for (const endpoint of toPoll) {
                 for (const poll of polls) {
-                    if (!poll.manufacturerIDs.includes(endpoint.getDevice().manufacturerID) ||
+                    if ((!poll.manufacturerIDs.includes(endpoint.getDevice().manufacturerID) &&
+                        !poll.manufacturerNames.includes(endpoint.getDevice().manufacturerName)) ||
                         !endpoint.supportsInputCluster(poll.read.cluster)) {
                         continue;
                     }

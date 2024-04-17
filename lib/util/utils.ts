@@ -4,6 +4,9 @@ import data from './data';
 import vm from 'vm';
 import fs from 'fs';
 import path from 'path';
+import {detailedDiff} from 'deep-object-diff';
+import objectAssignDeep from 'object-assign-deep';
+import type * as zhc from 'zigbee-herdsman-converters';
 
 // construct a local ISO8601 string (instead of UTC-based)
 // Example:
@@ -26,20 +29,6 @@ function toLocalISOString(date: Date): string {
         plusOrMinus + pad(tzOffset / 60) +
         ':' + pad(tzOffset % 60);
 }
-
-const endpointNames = [
-    'left', 'right', 'center', 'bottom_left', 'bottom_right', 'default',
-    'top_left', 'top_right', 'white', 'rgb', 'cct', 'system', 'top', 'bottom', 'center_left', 'center_right',
-    'ep1', 'ep2', 'row_1', 'row_2', 'row_3', 'row_4', 'relay', 'usb',
-    'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7', 'l8',
-    'l9', 'l10', 'l11', 'l12', 'l13', 'l14', 'l15', 'l16',
-    'button_1', 'button_2', 'button_3', 'button_4', 'button_5',
-    'button_6', 'button_7', 'button_8', 'button_9', 'button_10',
-    'button_11', 'button_12', 'button_13', 'button_14', 'button_15',
-    'button_16', 'button_17', 'button_18', 'button_19', 'button_20',
-    'button_light', 'button_fan_high', 'button_fan_med', 'button_fan_low',
-    'heat', 'cool', 'water', 'meter', 'wifi', 'no_occupancy_since',
-];
 
 function capitalize(s: string): string {
     return s[0].toUpperCase() + s.slice(1);
@@ -77,7 +66,9 @@ async function getZigbee2MQTTVersion(includeCommitHash=true): Promise<{commitHas
 }
 
 async function getDependencyVersion(depend: string): Promise<{version: string}> {
-    const packageJSON = await import(path.join(__dirname, '..', '..', 'node_modules', depend, 'package.json'));
+    const modulePath = path.dirname(require.resolve(depend));
+    const packageJSONPath = path.join(modulePath.slice(0, modulePath.indexOf(depend) + depend.length), 'package.json');
+    const packageJSON = await import(packageJSONPath);
     const version = packageJSON.version;
     return {version};
 }
@@ -132,8 +123,8 @@ function parseJSON(value: string, fallback: string): KeyValue | string {
     }
 }
 
-function loadModuleFromText(moduleCode: string): unknown {
-    const moduleFakePath = path.join(__dirname, 'externally-loaded.js');
+function loadModuleFromText(moduleCode: string, name?: string): unknown {
+    const moduleFakePath = path.join(__dirname, '..', '..', 'data', 'extension', name || 'externally-loaded.js');
     const sandbox = {
         require: require,
         module: {},
@@ -155,25 +146,21 @@ function loadModuleFromFile(modulePath: string): unknown {
     return loadModuleFromText(moduleCode);
 }
 
-function* getExternalConvertersDefinitions(settings: Settings): Generator<zhc.ExternalDefinition> {
-    const externalConverters = settings.external_converters;
+export function* loadExternalConverter(moduleName: string): Generator<ExternalDefinition> {
+    let converter;
 
-    for (const moduleName of externalConverters) {
-        let converter;
+    if (moduleName.endsWith('.js')) {
+        converter = loadModuleFromFile(data.joinPath(moduleName));
+    } else {
+        converter = require(moduleName);
+    }
 
-        if (moduleName.endsWith('.js')) {
-            converter = loadModuleFromFile(data.joinPath(moduleName));
-        } else {
-            converter = require(moduleName);
+    if (Array.isArray(converter)) {
+        for (const item of converter) {
+            yield item;
         }
-
-        if (Array.isArray(converter)) {
-            for (const item of converter) {
-                yield item;
-            }
-        } else {
-            yield converter;
-        }
+    } else {
+        yield converter;
     }
 }
 
@@ -249,16 +236,10 @@ function getAllFiles(path_: string): string[] {
 
 function validateFriendlyName(name: string, throwFirstError=false): string[] {
     const errors = [];
-    for (const endpointName of endpointNames) {
-        if (name.toLowerCase().endsWith('/' + endpointName)) {
-            errors.push(`friendly_name is not allowed to end with: '/${endpointName}'`);
-        }
-    }
 
     if (name.length === 0) errors.push(`friendly_name must be at least 1 char long`);
     if (name.endsWith('/') || name.startsWith('/')) errors.push(`friendly_name is not allowed to end or start with /`);
     if (containsControlCharacter(name)) errors.push(`friendly_name is not allowed to contain control char`);
-    if (endpointNames.includes(name)) errors.push(`Following friendly_name are not allowed: '${endpointNames}'`);
     if (name.match(/.*\/\d*$/)) errors.push(`Friendly name cannot end with a "/DIGIT" ('${name}')`);
     if (name.includes('#') || name.includes('+')) {
         errors.push(`MQTT wildcard (+ and #) not allowed in friendly_name ('${name}')`);
@@ -295,6 +276,8 @@ function isAvailabilityEnabledForEntity(entity: Device | Group, settings: Settin
     const enabledGlobal = settings.advanced.availability_timeout || settings.availability;
     if (!enabledGlobal) return false;
 
+    if (entity.isDevice() && entity.options.disabled) return false;
+
     const passlist = settings.advanced.availability_passlist.concat(settings.advanced.availability_whitelist);
     if (passlist.length > 0) {
         return passlist.includes(entity.name) || passlist.includes(entity.ieeeAddr);
@@ -304,14 +287,16 @@ function isAvailabilityEnabledForEntity(entity: Device | Group, settings: Settin
     return !blocklist.includes(entity.name) && !blocklist.includes(entity.ieeeAddr);
 }
 
-const entityIDRegex = new RegExp(`^(.+?)(?:/(${endpointNames.join('|')}|\\d+))?$`);
-function parseEntityID(ID: string): {ID: string, endpoint: string} {
-    const match = ID.match(entityIDRegex);
-    return match && {ID: match[1], endpoint: match[2]};
-}
-
 function isEndpoint(obj: unknown): obj is zh.Endpoint {
     return obj.constructor.name.toLowerCase() === 'endpoint';
+}
+
+function flatten<Type>(arr: Type[][]): Type[] {
+    return [].concat(...arr);
+}
+
+function arrayUnique<Type>(arr: Type[]): Type[] {
+    return [...new Set(arr)];
 }
 
 function isZHGroup(obj: unknown): obj is zh.Group {
@@ -341,12 +326,89 @@ function publishLastSeen(data: eventdata.LastSeenChanged, settings: Settings, al
     }
 }
 
+function filterProperties(filter: string[], data: KeyValue): void {
+    if (filter) {
+        for (const property of Object.keys(data)) {
+            if (filter.find((p) => property.match(`^${p}$`))) {
+                delete data[property];
+            }
+        }
+    }
+}
+
+function clone(obj: KeyValue): KeyValue {
+    return JSON.parse(JSON.stringify(obj));
+}
+
+export function isNumericExposeFeature(feature: zhc.Feature): feature is zhc.Numeric {
+    return feature?.type === 'numeric';
+}
+
+export function isEnumExposeFeature(feature: zhc.Feature): feature is zhc.Enum {
+    return feature?.type === 'enum';
+}
+
+export function isBinaryExposeFeature(feature: zhc.Feature): feature is zhc.Binary {
+    return feature?.type === 'binary';
+}
+
+function computeSettingsToChange(current: KeyValue, new_: KeyValue): KeyValue {
+    const diff: KeyValue = detailedDiff(current, new_);
+
+    // Remove any settings that are in the deleted.diff but not in the passed options
+    const cleanupDeleted = (options: KeyValue, deleted: KeyValue): void => {
+        for (const key of Object.keys(deleted)) {
+            if (!(key in options)) {
+                delete deleted[key];
+            } else if (!Array.isArray(options[key])) {
+                cleanupDeleted(options[key], deleted[key]);
+            }
+        }
+    };
+    cleanupDeleted(new_, diff.deleted);
+
+    // objectAssignDeep requires object prototype which is missing from detailedDiff, therefore clone
+    const newSettings = objectAssignDeep({}, clone(diff.added), clone(diff.updated), clone(diff.deleted));
+
+    // deep-object-diff converts arrays to objects, set original array back here
+    const convertBackArray = (before: KeyValue, after: KeyValue): void => {
+        for (const [key, afterValue] of Object.entries(after)) {
+            const beforeValue = before[key];
+            if (Array.isArray(beforeValue)) {
+                after[key] = beforeValue;
+            } else if (afterValue && typeof beforeValue === 'object') {
+                convertBackArray(beforeValue, afterValue);
+            }
+        }
+    };
+    convertBackArray(new_, newSettings);
+    return newSettings;
+}
+
+function getScenes(entity: zh.Endpoint | zh.Group): Scene[] {
+    const scenes: {[id: number]: Scene} = {};
+    const endpoints = isEndpoint(entity) ? [entity] : entity.members;
+    const groupID = isEndpoint(entity) ? 0 : entity.groupID;
+
+    for (const endpoint of endpoints) {
+        for (const [key, data] of Object.entries(endpoint.meta?.scenes || {})) {
+            const split = key.split('_');
+            const sceneID = parseInt(split[0], 10);
+            const sceneGroupID = parseInt(split[1], 10);
+            if (sceneGroupID === groupID) {
+                scenes[sceneID] = {id: sceneID, name: (data as KeyValue).name || `Scene ${sceneID}`};
+            }
+        }
+    }
+
+    return Object.values(scenes);
+}
 
 export default {
-    endpointNames, capitalize, getZigbee2MQTTVersion, getDependencyVersion, formatDate, objectHasProperties,
+    capitalize, getZigbee2MQTTVersion, getDependencyVersion, formatDate, objectHasProperties,
     equalsPartial, getObjectProperty, getResponse, parseJSON, loadModuleFromText, loadModuleFromFile,
-    getExternalConvertersDefinitions, removeNullPropertiesFromObject, toNetworkAddressHex, toSnakeCase,
-    parseEntityID, isEndpoint, isZHGroup, hours, minutes, seconds, validateFriendlyName, sleep,
+    removeNullPropertiesFromObject, toNetworkAddressHex, toSnakeCase,
+    isEndpoint, isZHGroup, hours, minutes, seconds, validateFriendlyName, sleep,
     sanitizeImageParameter, isAvailabilityEnabledForEntity, publishLastSeen, availabilityPayload,
-    getAllFiles,
+    getAllFiles, filterProperties, flatten, arrayUnique, clone, computeSettingsToChange, getScenes,
 };

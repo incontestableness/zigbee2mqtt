@@ -8,6 +8,7 @@ import utils from './util/utils';
 import stringify from 'json-stable-stringify-without-jsonify';
 import assert from 'assert';
 import bind from 'bind-decorator';
+import * as zhc from 'zigbee-herdsman-converters';
 
 // Extensions
 import ExtensionFrontend from './extension/frontend';
@@ -39,7 +40,15 @@ const AllExtensions = [
 type ExtensionArgs = [Zigbee, MQTT, State, PublishEntityState, EventBus,
     (enable: boolean, name: string) => Promise<void>, () => void, (extension: Extension) => Promise<void>];
 
-class Controller {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let sdNotify: any = null;
+try {
+    sdNotify = process.env.NOTIFY_SOCKET ? require('sd-notify') : null;
+} catch {
+    // sd-notify is optional
+}
+
+export class Controller {
     private eventBus: EventBus;
     private zigbee: Zigbee;
     private state: State;
@@ -49,15 +58,12 @@ class Controller {
     private extensions: Extension[];
     private extensionArgs: ExtensionArgs;
 
-    constructor(restartCallback: () => void, exitCallback: (code: number) => void) {
+    constructor(restartCallback: () => void, exitCallback: (code: number, restart: boolean) => void) {
         logger.init();
-        this.eventBus = new EventBus( /* istanbul ignore next */ (error) => {
-            logger.error(`Error: ${error.message}`);
-            logger.debug(error.stack);
-        });
+        this.eventBus = new EventBus();
         this.zigbee = new Zigbee(this.eventBus);
         this.mqtt = new MQTT(this.eventBus);
-        this.state = new State(this.eventBus);
+        this.state = new State(this.eventBus, this.zigbee);
         this.restartCallback = restartCallback;
         this.exitCallback = exitCallback;
 
@@ -86,6 +92,8 @@ class Controller {
             /* istanbul ignore next */
             settings.get().advanced.soft_reset_timeout !== 0 && new ExtensionSoftReset(...this.extensionArgs),
         ].filter((n) => n);
+
+        zhc.setLogger(logger);
     }
 
     async start(): Promise<void> {
@@ -121,7 +129,7 @@ class Controller {
         const devices = this.zigbee.devices(false);
         logger.info(`Currently ${devices.length} devices are joined:`);
         for (const device of devices) {
-            const model = device.definition ?
+            const model = device.isSupported ?
                 `${device.definition.model} - ${device.definition.vendor} ${device.definition.description}` :
                 'Not supported';
             logger.info(`${device.name} (${device.ieeeAddr}): ${model} (${device.zh.type})`);
@@ -144,8 +152,7 @@ class Controller {
         try {
             await this.mqtt.connect();
         } catch (error) {
-            logger.error(`MQTT failed to connect: ${error.message}`);
-            logger.error('Exiting...');
+            logger.error(`MQTT failed to connect, exiting...`);
             await this.zigbee.stop();
             await this.exit(1);
         }
@@ -157,13 +164,21 @@ class Controller {
         if (settings.get().advanced.cache_state_send_on_startup && settings.get().advanced.cache_state) {
             for (const entity of [...devices, ...this.zigbee.groups()]) {
                 if (this.state.exists(entity)) {
-                    this.publishEntityState(entity, this.state.get(entity));
+                    this.publishEntityState(entity, this.state.get(entity), 'publishCached');
                 }
             }
         }
 
         this.eventBus.onLastSeenChanged(this,
             (data) => utils.publishLastSeen(data, settings.get(), false, this.publishEntityState));
+
+        logger.info(`Zigbee2MQTT started!`);
+
+        const watchdogInterval = sdNotify?.watchdogInterval() || 0;
+        if (watchdogInterval > 0) {
+            sdNotify.startWatchdogMode(Math.floor(watchdogInterval / 2));
+        }
+        sdNotify?.ready();
     }
 
     @bind async enableDisableExtension(enable: boolean, name: string): Promise<void> {
@@ -188,6 +203,8 @@ class Controller {
     }
 
     async stop(restart = false): Promise<void> {
+        sdNotify?.stopping();
+
         // Call extensions
         await this.callExtensions('stop', this.extensions);
         this.eventBus.removeListeners(this);
@@ -204,6 +221,8 @@ class Controller {
             logger.error('Failed to stop Zigbee2MQTT');
             await this.exit(1, restart);
         }
+
+        sdNotify?.stopWatchdogMode();
     }
 
     async exit(code: number, restart = false): Promise<void> {
@@ -240,13 +259,16 @@ class Controller {
 
         if (entity.isDevice() && settings.get().mqtt.include_device_information) {
             message.device = {
-                friendlyName: entity.name, model: entity.definition ? entity.definition.model : 'unknown',
+                friendlyName: entity.name, model: entity.definition?.model,
                 ieeeAddr: entity.ieeeAddr, networkAddress: entity.zh.networkAddress, type: entity.zh.type,
-                manufacturerID: entity.zh.manufacturerID, manufacturerName: entity.zh.manufacturerName,
+                manufacturerID: entity.zh.manufacturerID,
                 powerSource: entity.zh.powerSource, applicationVersion: entity.zh.applicationVersion,
                 stackVersion: entity.zh.stackVersion, zclVersion: entity.zh.zclVersion,
                 hardwareVersion: entity.zh.hardwareVersion, dateCode: entity.zh.dateCode,
                 softwareBuildID: entity.zh.softwareBuildID,
+                // Manufacturer name can contain \u0000, remove this.
+                // https://github.com/home-assistant/core/issues/85691
+                manufacturerName: entity.zh.manufacturerName?.split('\u0000')[0],
             };
         }
 
@@ -265,10 +287,8 @@ class Controller {
             extension.adjustMessageBeforePublish?.(entity, message);
         }
 
-        // filter mqtt message attributes
-        if (entity.options.filtered_attributes) {
-            entity.options.filtered_attributes.forEach((a) => delete message[a]);
-        }
+        // Filter mqtt message attributes
+        utils.filterProperties(entity.options.filtered_attributes, message);
 
         if (Object.entries(message).length) {
             const output = settings.get().advanced.output;
